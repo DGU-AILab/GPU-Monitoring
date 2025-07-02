@@ -1,5 +1,28 @@
 #!/bin/bash
 
+# 함수: GPU 사용량 로깅
+# Usage: log_gpu_usage "<label>" "<command to run>"
+log_gpu_usage() {
+    local label="$1"
+    local cmd="$2"
+    echo "   🔧 $label usage:" >> "$LOG_FILE"
+    local output
+    while IFS= read -r line; do
+        local name=$(echo "$line" | cut -d',' -f1 | xargs)
+        local util=$(echo "$line" | cut -d',' -f2 | xargs)
+        echo "     - $name: ${util}% usage" >> "$LOG_FILE"
+    done < <(eval "$cmd")
+}
+
+# 함수: 슬랙 알림 전송
+# Usage: alert_slack "<text message>"
+alert_slack() {
+    local msg="$1"
+    curl -X POST -H 'Content-type: application/json' \
+        --data "{\"text\":\"$msg\"}" \
+        https://hooks.slack.com/services/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
+}
+
 SERVER_NAME="FARM9"
 
 LOG_FILE="gpu_container_usage.log"
@@ -10,25 +33,15 @@ echo "==================== [$TIMESTAMP] GPU Container Check ====================
 
 # 호스트의 GPU 상태 먼저 확인
 echo "▶️ Host GPU Status:" >> "$LOG_FILE"
-HOST_GPU_INFO=$(nvidia-smi --query-gpu=name,utilization.gpu --format=csv,noheader,nounits 2>&1)
+HOST_GPU_INFO_CMD="nvidia-smi --query-gpu=name,utilization.gpu --format=csv,noheader,nounits 2>&1"
 HOST_GPU_STATUS=$?
-
 if [ $HOST_GPU_STATUS -eq 0 ]; then
     echo "   ✅ Host GPU access: YES" >> "$LOG_FILE"
-    echo "   🔧 Host GPU usage:" >> "$LOG_FILE"
-    while IFS= read -r line; do
-        GPU_NAME=$(echo "$line" | cut -d',' -f1 | xargs)
-        GPU_UTIL=$(echo "$line" | cut -d',' -f2 | xargs)
-        echo "     - $GPU_NAME: ${GPU_UTIL}% usage" >> "$LOG_FILE"
-    done <<< "$HOST_GPU_INFO"
+    log_gpu_usage "Host GPU" "$HOST_GPU_INFO_CMD"
 else
-    # 슬랙 알림 전송 (호스트 GPU 접근 실패 시)
-    curl -X POST -H 'Content-type: application/json' \
-      --data "{\"text\":\"[ALERT] Host GPU access failed on server: $SERVER_NAME\"}" \
-      https://hooks.slack.com/services/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
-
+    alert_slack "[ALERT] Host GPU access failed on server: $SERVER_NAME"
     echo "   ❌ Host GPU access: NO" >> "$LOG_FILE"
-    echo "      ↪ Error: $HOST_GPU_INFO" >> "$LOG_FILE"
+    echo "      ↪ Error: $(eval "$HOST_GPU_INFO_CMD")" >> "$LOG_FILE"
 fi
 
 echo "" >> "$LOG_FILE"
@@ -36,6 +49,14 @@ echo "" >> "$LOG_FILE"
 # 모든 실행 중인 컨테이너 순회
 docker ps --format "{{.ID}} {{.Names}} {{.Image}}" | while read -r CONTAINER_ID CONTAINER_NAME CONTAINER_IMAGE; do
     echo "▶️ Container: $CONTAINER_NAME ($CONTAINER_ID) [$CONTAINER_IMAGE]" >> "$LOG_FILE"
+
+    echo "   🔍 Checking container runtime..." >> "$LOG_FILE"
+    RUNTIME=$(docker inspect --format='{{.HostConfig.Runtime}}' "$CONTAINER_ID")
+    echo "   ↪ Runtime: $RUNTIME" >> "$LOG_FILE"
+
+    echo "   🔍 Checking NVIDIA device files in container..." >> "$LOG_FILE"
+    DEVICE_FILES=$(docker exec "$CONTAINER_ID" ls /dev/nvidia* 2>&1)
+    echo "   ↪ Device files: $DEVICE_FILES" >> "$LOG_FILE"
 
     # 22번 포트 매핑된 호스트 포트 확인
     HOST_PORT=$(docker port "$CONTAINER_ID" 22 2>/dev/null | awk -F: '{print $2}' | tr -d ' ')
@@ -48,12 +69,7 @@ docker ps --format "{{.ID}} {{.Names}} {{.Image}}" | while read -r CONTAINER_ID 
 
     if [ $STATUS -eq 0 ]; then
         echo "   ✅ GPU access: YES" >> "$LOG_FILE"
-        echo "   🔧 GPU usage:" >> "$LOG_FILE"
-        while IFS= read -r line; do
-            GPU_NAME=$(echo "$line" | cut -d',' -f1 | xargs)
-            GPU_UTIL=$(echo "$line" | cut -d',' -f2 | xargs)
-            echo "     - $GPU_NAME: ${GPU_UTIL}% usage" >> "$LOG_FILE"
-        done <<< "$OUTPUT"
+        log_gpu_usage "Container GPU" "docker exec \"$CONTAINER_ID\" nvidia-smi --query-gpu=name,utilization.gpu --format=csv,noheader,nounits"
 
     else
         echo "   ❌ GPU access: NO (initial)" >> "$LOG_FILE"
@@ -68,24 +84,23 @@ docker ps --format "{{.ID}} {{.Names}} {{.Image}}" | while read -r CONTAINER_ID 
         sudo modprobe nvidia && sudo modprobe nvidia_uvm
 
         sleep 2  # 모듈 재로드 후 안정화 대기
+        echo "   🔍 Verifying NVIDIA modules loaded after reload..." >> "$LOG_FILE"
+        if lsmod | grep -q -E 'nvidia(_uvm)?'; then
+            echo "   ✅ NVIDIA modules are loaded" >> "$LOG_FILE"
+        else
+            echo "   ❌ NVIDIA modules failed to load" >> "$LOG_FILE"
+        fi
 
         OUTPUT2=$(docker exec "$CONTAINER_ID" nvidia-smi --query-gpu=name,utilization.gpu --format=csv,noheader,nounits 2>&1)
         STATUS2=$?
 
         if [ $STATUS2 -eq 0 ]; then
             echo "   ✅ GPU access: YES (after module reload)" >> "$LOG_FILE"
-            echo "   🔧 GPU usage:" >> "$LOG_FILE"
-            while IFS= read -r line; do
-                GPU_NAME=$(echo "$line" | cut -d',' -f1 | xargs)
-                GPU_UTIL=$(echo "$line" | cut -d',' -f2 | xargs)
-                echo "     - $GPU_NAME: ${GPU_UTIL}% usage" >> "$LOG_FILE"
-            done <<< "$OUTPUT2"
+            log_gpu_usage "Container GPU" "docker exec \"$CONTAINER_ID\" nvidia-smi --query-gpu=name,utilization.gpu --format=csv,noheader,nounits"
         else
             echo "   ❌ GPU access: STILL FAILING after module reload" >> "$LOG_FILE"
             # 슬랙 알림 전송
-            curl -X POST -H 'Content-type: application/json' \
-              --data "{\"text\":\"[ALERT] GPU access still failing after reload in container: $CONTAINER_NAME ($CONTAINER_ID)\"}" \
-              https://hooks.slack.com/services/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
+            alert_slack "[ALERT] GPU access still failing after reload in container: $CONTAINER_NAME ($CONTAINER_ID)"
             echo "      ↪ Error: $OUTPUT2" >> "$LOG_FILE"
         fi
     fi
