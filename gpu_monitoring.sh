@@ -23,6 +23,20 @@ alert_slack() {
         https://hooks.slack.com/services/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
 }
 
+# 함수: 모든 컨테이너 또는 특정 컨테이너에 접속한 사용자에게 메시지 브로드캐스트
+broadcast_shutdown_message() {
+    local msg="$1"
+    local target_container="$2"
+
+    if [ -z "$target_container" ]; then
+        for container in $(docker ps -q); do
+            docker exec "$container" bash -c "echo '$msg' | wall 2>/dev/null"
+        done
+    else
+        docker exec "$target_container" bash -c "echo '$msg' | wall 2>/dev/null"
+    fi
+}
+
 SERVER_NAME="FARM9"
 
 LOG_FILE="gpu_container_usage.log"
@@ -42,6 +56,23 @@ else
     alert_slack "[ALERT] Host GPU access failed on server: $SERVER_NAME"
     echo "   ❌ Host GPU access: NO" >> "$LOG_FILE"
     echo "      ↪ Error: $(eval "$HOST_GPU_INFO_CMD")" >> "$LOG_FILE"
+    echo "   🔁 Rebooting host server due to GPU access failure..." >> "$LOG_FILE"
+
+    broadcast_shutdown_message "[ALERT] ${SERVER_NAME} 서버가 10분 후 재부팅됩니다. 저장하지 않은 작업은 미리 백업해주세요."
+    sleep 300
+    broadcast_shutdown_message "[ALERT] ${SERVER_NAME} 서버가 5분 후 재부팅됩니다."
+    sleep 240
+
+    broadcast_shutdown_message "[ALERT] ${SERVER_NAME} 서버가 1분 후 재부팅됩니다."
+    sleep 50
+
+    for i in $(seq 10 -1 1); do
+        broadcast_shutdown_message "[ALERT] 서버 재부팅까지 ${i}초 남았습니다."
+        sleep 1
+    done
+
+    broadcast_shutdown_message "[ALERT] 이제 ${SERVER_NAME} 서버가 재부팅됩니다."
+    sudo reboot
 fi
 
 echo "" >> "$LOG_FILE"
@@ -99,9 +130,22 @@ docker ps --format "{{.ID}} {{.Names}} {{.Image}}" | while read -r CONTAINER_ID 
             log_gpu_usage "Container GPU" "docker exec \"$CONTAINER_ID\" nvidia-smi --query-gpu=name,utilization.gpu --format=csv,noheader,nounits"
         else
             echo "   ❌ GPU access: STILL FAILING after module reload" >> "$LOG_FILE"
-            # 슬랙 알림 전송
             alert_slack "[ALERT] GPU access still failing after reload in container: $CONTAINER_NAME ($CONTAINER_ID)"
+            echo "   🔁 Restarting container $CONTAINER_NAME ($CONTAINER_ID) on $SERVER_NAME due to persistent GPU failure..." >> "$LOG_FILE"
+            broadcast_shutdown_message "[ALERT] ${SERVER_NAME} 서버의 컨테이너 $CONTAINER_NAME 가 10분 후 재시작됩니다. 저장하지 않은 작업은 미리 백업해주세요." "$CONTAINER_ID"
+            sleep 300
+            broadcast_shutdown_message "[ALERT] ${SERVER_NAME} 서버의 컨테이너 $CONTAINER_NAME 가 5분 후 재시작됩니다." "$CONTAINER_ID"
+            sleep 240
+            broadcast_shutdown_message "[ALERT] ${SERVER_NAME} 서버의 컨테이너 $CONTAINER_NAME 가 1분 후 재시작됩니다." "$CONTAINER_ID"
+            sleep 50
+            for i in $(seq 10 -1 1); do
+                broadcast_shutdown_message "[ALERT] ${CONTAINER_NAME} 컨테이너 재시작까지 ${i}초 남았습니다." "$CONTAINER_ID"
+                sleep 1
+            done
+            broadcast_shutdown_message "[ALERT] ${CONTAINER_NAME} 컨테이너를 이제 재시작합니다." "$CONTAINER_ID"
+            docker restart "$CONTAINER_ID" >> "$LOG_FILE" 2>&1
             echo "      ↪ Error: $OUTPUT2" >> "$LOG_FILE"
+            alert_slack "[ALERT] Restarted container $CONTAINER_NAME ($CONTAINER_ID) on $SERVER_NAME due to persistent GPU failure."
         fi
     fi
 
